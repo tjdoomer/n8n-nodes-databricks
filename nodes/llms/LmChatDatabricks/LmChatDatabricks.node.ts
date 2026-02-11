@@ -268,10 +268,47 @@ export class LmChatDatabricks implements INodeType {
             return_trace?: boolean;
         };
 
-        // Fix baseURL construction to use correct serving-endpoints path
-        const configuration = {
+        // Detect Claude/Anthropic models to disable unsupported OpenAI-specific features
+        const isClaude = modelName.toLowerCase().includes('claude') ||
+            modelName.toLowerCase().includes('anthropic');
+
+        // For Claude models, use a custom fetch wrapper that strips unsupported
+        // OpenAI parameters (frequency_penalty, presence_penalty, parallel_tool_calls, etc.)
+        // which cause 400 errors on Databricks Model Serving for Anthropic models.
+        const configuration: Record<string, any> = {
             baseURL: `${credentials.host}/serving-endpoints`,
         };
+
+        if (isClaude) {
+            const UNSUPPORTED_CLAUDE_PARAMS = [
+                'frequency_penalty',
+                'presence_penalty',
+                'parallel_tool_calls',
+                'logprobs',
+                'top_logprobs',
+                'logit_bias',
+                'stream_options',
+            ];
+
+            configuration.fetch = async (url: string, init: any) => {
+                if (init?.body && typeof init.body === 'string') {
+                    try {
+                        const body = JSON.parse(init.body);
+                        for (const param of UNSUPPORTED_CLAUDE_PARAMS) {
+                            delete body[param];
+                        }
+                        // Claude rejects requests with both temperature and top_p
+                        if (body.temperature !== undefined && body.top_p !== undefined) {
+                            delete body.top_p;
+                        }
+                        init.body = JSON.stringify(body);
+                    } catch {
+                        // If body isn't valid JSON, pass through unchanged
+                    }
+                }
+                return fetch(url, init);
+            };
+        }
 
         // Build modelKwargs with response_format and databricks_options
         const modelKwargs: any = {};
@@ -298,7 +335,7 @@ export class LmChatDatabricks implements INodeType {
             modelName,
             temperature: options.temperature,
             maxTokens: options.maxTokens,
-            topP: options.topP,
+            topP: isClaude ? undefined : options.topP,
             timeout: options.timeout ?? 60000,
             maxRetries: options.maxRetries ?? 2,
             configuration,
